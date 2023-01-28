@@ -1,5 +1,5 @@
 provider "aws" {
-  region = local.region
+  region = var.region
 }
 
 provider "kubernetes" {
@@ -20,6 +20,7 @@ data "aws_eks_cluster_auth" "this" {
   name = module.eks_blueprints.eks_cluster_id
 }
 
+#Choosing Only Availability Zones (no Local Zones):
 data "aws_availability_zones" "available" {
   filter {
     name   = "opt-in-status"
@@ -28,19 +29,40 @@ data "aws_availability_zones" "available" {
 }
 
 locals {
-  name = basename(path.cwd)
+  name = var.cluster_base_name
   # var.cluster_name is for Terratest
-  cluster_name = coalesce(var.cluster_name, local.name)
-  region       = "us-west-2"
+  cluster_name = var.cluster_name
+  region       = var.region
 
-  vpc_cidr = "10.0.0.0/16"
-  azs      = slice(data.aws_availability_zones.available.names, 0, 3)
+  azs = slice(data.aws_availability_zones.available.names, 0, 3)
 
   tags = {
-    Blueprint  = local.name
-    GithubRepo = "github.com/aws-ia/terraform-aws-eks-blueprints"
+    PartOf    = var.cluster_name
+    ManagedBy = "terraform-blueprints"
   }
 }
+
+
+# SSH key gitlab
+#resource "aws_secretsmanager_secret" "gitlab_key" {
+#  name = "github-ssh-key"
+#  secret_string = "ssh-rsa AAAAB3NzaC1yc2EAAAADAQABAAABAQCZy3KsDW6ugYPFCR/TelQfKH2W5AmTT6Ly6Ej7t1Y1co0kajXw3e/bEwbT39KAY8vtNHXBomwJI2v/cHDLOIkgZI/NhtXq3JQmM4ru2/XBlAMyZZpM/0Y3l2+czQacyowjW6Pio/cTwxL3pwuK0zZNN4d5PjX4sUBGcHt0TB5KxvYBPffcNQqZyUmfRQoJT5SQOHUWxghuG4tHvT0EDm3CD9kSVQSufKRmdTZMybxZ1L7MRPTfAwbI3RzgTuNHvCOlZU7Bfm2sJlWt8LdH56E+Tb3QlaZlbhFLSBF5dE78qigo3oATk3ZuCsX56qAPk3ZKQkBg3DYcgxcI0w0FWIlH imported-openssh-key"
+#}
+#
+resource "aws_secretsmanager_secret" "github-ssh" {
+  name = "github-ssh"
+  tags = {
+    OwnedBy = "argocd"
+    Purpouse = "gitlab"
+  }
+}
+
+resource "aws_secretsmanager_secret_version" "github-ssh" {
+  secret_id     = aws_secretsmanager_secret.github-ssh.id
+  secret_string = "${file("secret.txt")}"
+}
+
+
 
 #---------------------------------------------------------------
 # EKS Blueprints
@@ -57,12 +79,19 @@ module "eks_blueprints" {
 
   managed_node_groups = {
     mg_5 = {
-      node_group_name = "managed-ondemand"
+      node_group_name = "on_demand"
       instance_types  = ["m5.large"]
-      min_size        = 3
-      max_size        = 3
-      desired_size    = 3
+      min_size        = var.min_nodes
+      max_size        = var.max_nodes
+      desired_size    = var.desired_nodes
       subnet_ids      = module.vpc.private_subnets
+      update_config = [{
+        max_unavailable_percentage = 30
+      }]
+      k8s_labels = {
+        Environment = var.environment
+        WorkerType  = "on_demand"
+      }
     }
   }
 
@@ -86,9 +115,35 @@ module "eks_blueprints_kubernetes_addons" {
   # Add-ons
   enable_aws_load_balancer_controller = true
   enable_metrics_server               = true
-  enable_aws_cloudwatch_metrics       = true
-  enable_kubecost                     = true
-  enable_gatekeeper                   = true
+  #enable_aws_cloudwatch_metrics       = true
+  enable_prometheus                   = true
+  enable_kube_state_metrics           = true
+  enable_ingress_nginx                = true
+  enable_argocd                       = true
+
+  argocd_helm_config = {
+    name             = "argo-cd"
+    chart            = "argo-cd"
+    repository       = "https://argoproj.github.io/argo-helm"
+    version          = "3.29.5"
+    namespace        = "argocd"
+    timeout          = "1200"
+    create_namespace = true
+    #    values           = [templatefile("${path.module}/argocd-values.yaml", {})]
+  }
+
+
+  argocd_applications     = {
+    workloads = {
+      path                = "charts/docker-registry"
+      repo_url            = "git@github.com:xymelin/helm-charts.git"
+      project             = "test"
+      ssh_key_secret_name = "github-ssh"  # Needed for private repos
+      insecure            = true # Set to true to disable the server's certificate verification
+    }
+  }
+  enable_grafana              = true
+  enable_promtail             = true
 
   enable_cluster_autoscaler = true
   cluster_autoscaler_helm_config = {
@@ -114,7 +169,11 @@ module "eks_blueprints_kubernetes_addons" {
   # enable_cert_manager_csi_driver = true
 
   tags = local.tags
+  depends_on = [
+    aws_secretsmanager_secret.github-ssh
+  ]
 }
+
 
 #---------------------------------------------------------------
 # Supporting Resources
@@ -124,12 +183,12 @@ module "vpc" {
   source  = "terraform-aws-modules/vpc/aws"
   version = "~> 3.0"
 
-  name = local.name
-  cidr = local.vpc_cidr
+  name = "${var.cluster_name}-vpc"
+  cidr = var.vpc_cidr
 
   azs             = local.azs
-  public_subnets  = [for k, v in local.azs : cidrsubnet(local.vpc_cidr, 8, k)]
-  private_subnets = [for k, v in local.azs : cidrsubnet(local.vpc_cidr, 8, k + 10)]
+  public_subnets  = [for k, v in local.azs : cidrsubnet(var.vpc_cidr, 8, k + 10)]
+  private_subnets = [for k, v in local.azs : cidrsubnet(var.vpc_cidr, 8, k + 20)]
 
   enable_nat_gateway   = true
   single_nat_gateway   = true
